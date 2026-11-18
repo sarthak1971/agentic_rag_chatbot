@@ -17,7 +17,7 @@ from langgraph.graph import StateGraph, END
 load_dotenv()
 
 st.set_page_config(
-    page_title="Agentic RAG with LangGraph",
+    page_title="Agentic RAG Chatbot",
     page_icon=":brain:",
     layout="centered",
 )
