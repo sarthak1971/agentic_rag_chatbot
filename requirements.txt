@@ -14,3 +14,4 @@ langchain_openai
 langgraph
 typesense
 streamlit
+docx
