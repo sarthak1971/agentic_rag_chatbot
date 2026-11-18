@@ -1,6 +1,7 @@
 import os
 from typing import TypedDict, List
 
+import docx  # python-docx; imported as a module so it doesn't clash with langchain's Document
 import streamlit as st
 from dotenv import load_dotenv
 from pypdf import PdfReader
@@ -124,21 +125,53 @@ def rebuild_pipeline(model_name: str, temperature: float, top_k: int):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+FILE_TYPES = ["pdf", "txt", "md", "docx", "csv"]
+
+
 def load_uploaded_file(uploaded) -> List[Document]:
-    """Turn an uploaded .txt or .pdf into chunked Documents."""
-    if uploaded.name.lower().endswith(".pdf"):
+    """Turn an uploaded file (.pdf, .docx, .txt, .md, .csv) into chunked Documents."""
+    name = uploaded.name
+    lower = name.lower()
+
+    if lower.endswith(".pdf"):
         reader = PdfReader(uploaded)
         raw_docs = [
-            Document(page_content=page.extract_text() or "", metadata={"source": uploaded.name, "page": i + 1})
+            Document(page_content=page.extract_text() or "", metadata={"source": name, "page": i + 1})
             for i, page in enumerate(reader.pages)
         ]
-    else:
+    elif lower.endswith(".docx"):
+        document = docx.Document(uploaded)
+        text = "\n".join(p.text for p in document.paragraphs)
+        raw_docs = [Document(page_content=text, metadata={"source": name})]
+    else:  # .txt, .md, .csv are read as plain text
         text = uploaded.read().decode("utf-8", errors="ignore")
-        raw_docs = [Document(page_content=text, metadata={"source": uploaded.name})]
+        raw_docs = [Document(page_content=text, metadata={"source": name})]
 
     raw_docs = [d for d in raw_docs if d.page_content.strip()]
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     return splitter.split_documents(raw_docs)
+
+
+def add_files(files) -> List[str]:
+    """Add files to the knowledge base, skipping ones already added. Returns a status message per file."""
+    messages = []
+    for f in files:
+        file_id = (f.name, f.size)
+        if file_id in st.session_state.loaded_files:
+            messages.append(f"{f.name}: already added, skipped")
+            continue
+        try:
+            chunks = load_uploaded_file(f)
+        except Exception as e:
+            messages.append(f"{f.name}: could not be read ({e})")
+            continue
+        if not chunks:
+            messages.append(f"{f.name}: no readable text found (a scanned PDF needs OCR)")
+            continue
+        st.session_state.docs.extend(chunks)
+        st.session_state.loaded_files.add(file_id)
+        messages.append(f"{f.name}: added {len(chunks)} chunks")
+    return messages
 
 
 def render_meta(meta: dict):
@@ -160,6 +193,8 @@ if "docs" not in st.session_state:
     st.session_state.docs = [Document(page_content=t, metadata={"source": "sample knowledge base"}) for t in SAMPLE_TEXTS]
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "loaded_files" not in st.session_state:
+    st.session_state.loaded_files = set()
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -175,16 +210,19 @@ with st.sidebar:
 
     st.header("Knowledge base")
     st.caption(f"{len(st.session_state.docs)} chunks loaded")
-    uploads = st.file_uploader("Add .pdf or .txt files", type=["pdf", "txt"], accept_multiple_files=True)
+    st.caption("You can also attach files directly in the chat box.")
+    uploads = st.file_uploader(
+        "Add files (PDF, DOCX, TXT, MD, CSV)", type=FILE_TYPES, accept_multiple_files=True
+    )
     if st.button("Add to knowledge base", disabled=not uploads):
         with st.spinner("Reading and splitting files..."):
-            for f in uploads:
-                st.session_state.docs.extend(load_uploaded_file(f))
+            for line in add_files(uploads):
+                st.write(line)
         st.session_state.pipeline_key = None  # force rebuild
-        st.success("Files added.")
 
     if st.button("Reset knowledge base"):
         st.session_state.docs = [Document(page_content=t, metadata={"source": "sample knowledge base"}) for t in SAMPLE_TEXTS]
+        st.session_state.loaded_files = set()
         st.session_state.pipeline_key = None
 
     if st.button("Clear chat"):
@@ -209,31 +247,53 @@ for message in st.session_state.messages:
         if message.get("meta"):
             render_meta(message["meta"])
 
-user_prompt = st.chat_input("Ask a question...")
-if user_prompt:
-    st.session_state.messages.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
+submission = st.chat_input(
+    "Ask a question or attach files...",
+    accept_file="multiple",
+    file_type=FILE_TYPES,
+)
 
-    with st.chat_message("assistant"):
-        try:
-            with st.spinner("Thinking..."):
-                result = st.session_state.graph.invoke(
-                    {
-                        "question": user_prompt,
-                        "documents": [],
-                        "answer": "",
-                        "needs_retrieval": False,
-                    }
+if submission:
+    user_prompt = (submission.text or "").strip()
+    attached = list(submission.files or [])
+
+    # Files attached in the chat box go into the knowledge base first
+    if attached:
+        with st.chat_message("assistant"):
+            with st.spinner("Reading files and updating the knowledge base..."):
+                status = add_files(attached)
+                rebuild_pipeline(model_name, temperature, top_k)
+            note = "**Knowledge base updated:**\n" + "\n".join(f"- {s}" for s in status)
+            st.markdown(note)
+        st.session_state.messages.append({"role": "assistant", "content": note})
+
+    if not user_prompt:
+        # Only files were sent, so there is nothing to answer yet
+        pass
+    else:
+        st.session_state.messages.append({"role": "user", "content": user_prompt})
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("Thinking..."):
+                    result = st.session_state.graph.invoke(
+                        {
+                            "question": user_prompt,
+                            "documents": [],
+                            "answer": "",
+                            "needs_retrieval": False,
+                        }
+                    )
+                st.markdown(result["answer"])
+                meta = {
+                    "needs_retrieval": result["needs_retrieval"],
+                    "documents": result["documents"],
+                }
+                render_meta(meta)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": result["answer"], "meta": meta}
                 )
-            st.markdown(result["answer"])
-            meta = {
-                "needs_retrieval": result["needs_retrieval"],
-                "documents": result["documents"],
-            }
-            render_meta(meta)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": result["answer"], "meta": meta}
-            )
-        except Exception as e:
-            st.error(f"Something went wrong: {e}")
+            except Exception as e:
+                st.error(f"Something went wrong: {e}")
