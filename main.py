@@ -200,7 +200,7 @@ if st.session_state.get("pipeline_key") != current_key:
 # ---------------------------------------------------------------------------
 # Chat UI
 # ---------------------------------------------------------------------------
-st.title("🤖 Agentic RAG with LangGraph")
+st.title("🤖 Agentic RAG Chatbot")
 st.caption("Decides whether to retrieve, then answers with Groq.")
 
 for message in st.session_state.messages:
